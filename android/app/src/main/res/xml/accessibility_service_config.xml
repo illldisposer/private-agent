@@ -1,11 +1,16 @@
-<?xml version="1.0" encoding="utf-8"?>
-<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-    android:description="@string/accessibility_service_description"
+<!-- Datei: android/app/src/main/res/xml/accessibility_service_config.xml -->
+<!-- Falls diese Datei bereits existiert, merge den Inhalt -->
+
+<accessibility-service
+    xmlns:android="http://schemas.android.com/apk/res/android"
     android:accessibilityEventTypes="typeAllMask"
-    android:accessibilityFlags="flagDefault|flagIncludeNotImportantViews|flagRequestTouchExplorationMode|flagRetrieveInteractiveWindows"
-    android:canRetrieveWindowContent="true"
+    android:accessibilityFeedbackType="feedbackAllMask"
+    android:accessibilityFlags="
+        flagReportViewIds|
+        flagRetrieveInteractiveWindows|
+        flagRequestTouchExplorationMode"
     android:canPerformGestures="true"
-    android:canTakeScreenshot="true"
-    android:accessibilityFeedbackType="feedbackGeneric"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/accessibility_service_description"
     android:notificationTimeout="100"
-    android:settingsActivity="com.orailnoor.privateagent.MainActivity" />
+    android:settingsActivity=".SettingsActivity" />
