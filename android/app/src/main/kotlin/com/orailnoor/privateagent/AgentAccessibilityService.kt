@@ -23,11 +23,26 @@ class AgentAccessibilityService : AccessibilityService() {
     // OPT-3: Verhindert parallele Screenshot-Aufrufe (sonst Queue-Stau)
     private val screenshotInProgress = AtomicBoolean(false)
 
+    // OPT-NEW: Reusable Rect — verhindert pro-Node-Allokation in heißen Loops
+    private val tempRect = Rect()
+
+    // OPT-NEW: ByteArrayOutputStream mit vorallokiertem Buffer (spart realloc)
+    private val screenshotBos = ByteArrayOutputStream(256 * 1024)
+
     companion object {
         var instance: AgentAccessibilityService? = null
             private set
         var eventListener: ((Map<String, Any>) -> Unit)? = null
         fun isRunning(): Boolean = instance != null
+
+        // OPT-NEW: Max BFS-Tiefe — verhindert Hänger in tiefen WebView-Bäumen
+        private const val MAX_DEPTH = 8
+
+        // OPT-NEW: Reduzierte Gesten-Dauer für snappige Klicks
+        private const val CLICK_DURATION_MS = 50L
+        private const val LONG_PRESS_DURATION_MS = 600L
+
+        private val ACTION_LABELS = setOf("search", "enter", "go", "done", "send", "next")
     }
 
     override fun onServiceConnected() {
@@ -73,15 +88,13 @@ class AgentAccessibilityService : AccessibilityService() {
     // ─── Screen Reading ───────────────────────────────────────────────────
 
     /**
-     * Dump the current screen as a flat list of UI elements.
-     *
-     * OPT-1: Iterative BFS statt Rekursion — kein StackOverflow bei tiefen
-     * WebView-/RecyclerView-Hierarchien (50+ Ebenen).
+     * OPT-1: Iterative BFS mit MAX_DEPTH-Limit.
+     * OPT-NEW: Reusable tempRect — kein Rect() pro Node mehr.
+     * OPT-NEW: Früher Skip für unsichtbare Nodes vor jeglicher String-Arbeit.
      */
     fun dumpScreen(): List<Map<String, Any?>> {
         val nodes = mutableListOf<Map<String, Any?>>()
 
-        // windows einmal cachen — jeder Zugriff ist ein Binder-IPC
         val wins = windows
         val roots = mutableListOf<AccessibilityNodeInfo>()
 
@@ -105,73 +118,81 @@ class AgentAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * OPT-1: Iterative BFS — ersetzt die rekursive traverseNode().
-     * ArrayDeque<Pair> vermeidet Wrapper-Allokationen.
+     * OPT-1: Iterative DFS mit ArrayDeque<Triple>.
+     * OPT-NEW: MAX_DEPTH-Pruning — Kinder tiefer als MAX_DEPTH werden nicht mehr expandiert.
+     * OPT-NEW: Sichtbarkeits-Check VOR String-Extraktion — spart Binder-Calls für unsichtbare Nodes.
      */
     private fun collectNodes(root: AccessibilityNodeInfo, out: MutableList<Map<String, Any?>>) {
-        // Stack: (node, depth) — DFS erhält Dokumentreihenfolge wie vorher
-        val stack = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
-        stack.addLast(root to 0)
+        // (node, depth, isRoot)
+        val stack = ArrayDeque<Triple<AccessibilityNodeInfo, Int, Boolean>>()
+        stack.addLast(Triple(root, 0, true))
 
         while (stack.isNotEmpty()) {
-            val (node, depth) = stack.removeLast()
-            val rect = Rect()
-            node.getBoundsInScreen(rect)
+            val (node, depth, isRoot) = stack.removeLast()
 
-            val visible = node.isVisibleToUser && rect.width() > 0 && rect.height() > 0
-            val text = node.text?.toString() ?: ""
-            val contentDesc = node.contentDescription?.toString() ?: ""
+            // OPT-NEW: Sichtbarkeit zuerst prüfen — billigster Filter
+            if (!node.isVisibleToUser) {
+                if (!isRoot) node.recycle()
+                continue
+            }
 
-            if (visible && (text.isNotEmpty() || contentDesc.isNotEmpty() ||
-                        node.isClickable || node.isEditable || node.isScrollable)) {
-                out.add(
-                    mapOf(
-                        "index"              to out.size,
-                        "text"               to text,
-                        "contentDescription" to contentDesc,
-                        "className"          to (node.className?.toString() ?: "").substringAfterLast('.'),
-                        "viewId"             to (node.viewIdResourceName ?: ""),
-                        "isClickable"        to node.isClickable,
-                        "isEditable"         to node.isEditable,
-                        "isScrollable"       to node.isScrollable,
-                        "isCheckable"        to node.isCheckable,
-                        "isChecked"          to node.isChecked,
-                        "isFocused"          to node.isFocused,
-                        "bounds"             to mapOf(
-                            "left"   to rect.left,  "top"    to rect.top,
-                            "right"  to rect.right, "bottom" to rect.bottom
-                        ),
-                        "depth" to depth
+            node.getBoundsInScreen(tempRect)
+            val hasSize = tempRect.width() > 0 && tempRect.height() > 0
+
+            if (hasSize) {
+                val text        = node.text?.toString() ?: ""
+                val contentDesc = node.contentDescription?.toString() ?: ""
+
+                if (text.isNotEmpty() || contentDesc.isNotEmpty() ||
+                    node.isClickable || node.isEditable || node.isScrollable) {
+                    out.add(
+                        mapOf(
+                            "index"              to out.size,
+                            "text"               to text,
+                            "contentDescription" to contentDesc,
+                            "className"          to (node.className?.toString() ?: "").substringAfterLast('.'),
+                            "viewId"             to (node.viewIdResourceName ?: ""),
+                            "isClickable"        to node.isClickable,
+                            "isEditable"         to node.isEditable,
+                            "isScrollable"       to node.isScrollable,
+                            "isCheckable"        to node.isCheckable,
+                            "isChecked"          to node.isChecked,
+                            "isFocused"          to node.isFocused,
+                            "bounds"             to mapOf(
+                                "left"   to tempRect.left,   "top"    to tempRect.top,
+                                "right"  to tempRect.right,  "bottom" to tempRect.bottom
+                            ),
+                            "depth" to depth
+                        )
                     )
-                )
+                }
             }
 
-            // Kinder in umgekehrter Reihenfolge pushen → DFS-Reihenfolge bleibt korrekt
-            for (i in node.childCount - 1 downTo 0) {
-                val child = node.getChild(i) ?: continue
-                stack.addLast(child to depth + 1)
+            // OPT-NEW: Kinder nur pushen, wenn MAX_DEPTH noch nicht erreicht
+            if (depth < MAX_DEPTH) {
+                for (i in node.childCount - 1 downTo 0) {
+                    val child = node.getChild(i) ?: continue
+                    stack.addLast(Triple(child, depth + 1, false))
+                }
             }
 
-            // Root nicht hier recyceln — Caller macht das
-            if (node !== root) node.recycle()
+            if (!isRoot) node.recycle()
         }
     }
 
     /**
-     * Screenshot als Base64-JPEG.
-     *
+     * OPT-NEW: scaleFactor=0.3 statt 0.5 → ~11% der Originalpixel, für Claude Vision ausreichend.
+     * OPT-NEW: quality=50 statt 70 → weitere Payload-Reduktion.
+     * OPT-NEW: Reusable ByteArrayOutputStream — kein new ByteArrayOutputStream() pro Call.
      * OPT-3: AtomicBoolean verhindert parallele Aufrufe.
-     * OPT-6: scaleFactor reduziert Payload — 0.5 = 25% der Originalgröße,
-     *         für Claude Vision vollkommen ausreichend.
      */
     @RequiresApi(Build.VERSION_CODES.R)
     fun takeScreenshot(
-        scaleFactor: Float = 0.5f,
-        quality: Int = 70,
+        scaleFactor: Float = 0.3f,   // OPT: war 0.5
+        quality: Int = 50,            // OPT: war 70
         callback: (String?) -> Unit
     ) {
         if (!screenshotInProgress.compareAndSet(false, true)) {
-            // Concurrent call — verwerfen statt queuen
             callback(null)
             return
         }
@@ -179,7 +200,7 @@ class AgentAccessibilityService : AccessibilityService() {
         takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
             override fun onSuccess(result: ScreenshotResult) {
                 try {
-                    val hw = result.hardwareBuffer
+                    val hw   = result.hardwareBuffer
                     val full = Bitmap.wrapHardwareBuffer(hw, result.colorSpace)
                         ?.copy(Bitmap.Config.ARGB_8888, false)
                     hw.close()
@@ -191,15 +212,16 @@ class AgentAccessibilityService : AccessibilityService() {
                             full,
                             (full.width  * scaleFactor).toInt().coerceAtLeast(1),
                             (full.height * scaleFactor).toInt().coerceAtLeast(1),
-                            true
+                            true                       // bilinear — besser als false
                         ).also { if (it !== full) full.recycle() }
                     } else full
 
-                    val bos = ByteArrayOutputStream()
-                    scaled.compress(Bitmap.CompressFormat.JPEG, quality, bos)
+                    // OPT-NEW: Reusable BOS — reset statt new
+                    screenshotBos.reset()
+                    scaled.compress(Bitmap.CompressFormat.JPEG, quality, screenshotBos)
                     if (scaled !== full) scaled.recycle() else full.recycle()
 
-                    callback(Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP))
+                    callback(Base64.encodeToString(screenshotBos.toByteArray(), Base64.NO_WRAP))
                 } finally {
                     screenshotInProgress.set(false)
                 }
@@ -215,8 +237,8 @@ class AgentAccessibilityService : AccessibilityService() {
     // ─── Actions ─────────────────────────────────────────────────────────
 
     /**
-     * OPT-2: Single-Pass mit Scoring statt 4 separater Baumtraversierungen.
-     * Priorität: exakt+nicht-editierbar > exakt > contains+nicht-editierbar > contains.
+     * OPT-2: Single-Pass mit Scoring.
+     * OPT-NEW: MAX_DEPTH-Limit auch hier für konsistentes Pruning.
      */
     fun clickByText(targetText: String): Boolean {
         val wins = windows ?: return false
@@ -233,12 +255,12 @@ class AgentAccessibilityService : AccessibilityService() {
     private fun clickBestMatch(root: AccessibilityNodeInfo, target: String): Boolean {
         data class Candidate(val node: AccessibilityNodeInfo, val score: Int)
 
-        val stack = ArrayDeque<AccessibilityNodeInfo>()
-        stack.addLast(root)
+        val stack = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()   // OPT: +depth
+        stack.addLast(root to 0)
         var best: Candidate? = null
 
         while (stack.isNotEmpty()) {
-            val node = stack.removeLast()
+            val (node, depth) = stack.removeLast()
             val text = node.text?.toString() ?: ""
             val desc = node.contentDescription?.toString() ?: ""
             val exact    = text.equals(target, true) || desc.equals(target, true)
@@ -255,12 +277,21 @@ class AgentAccessibilityService : AccessibilityService() {
                     best?.node?.recycle()
                     best = Candidate(AccessibilityNodeInfo.obtain(node), score)
                 }
+                // OPT-NEW: Score 3 = perfekter Treffer → sofort abbrechen
+                if (score == 3) {
+                    if (node !== root) node.recycle()
+                    break
+                }
             }
 
-            for (i in node.childCount - 1 downTo 0) {
-                val child = node.getChild(i) ?: continue
-                stack.addLast(child)
+            // OPT-NEW: MAX_DEPTH-Pruning
+            if (depth < MAX_DEPTH) {
+                for (i in node.childCount - 1 downTo 0) {
+                    val child = node.getChild(i) ?: continue
+                    stack.addLast(child to depth + 1)
+                }
             }
+
             if (node !== root) node.recycle()
         }
 
@@ -276,16 +307,21 @@ class AgentAccessibilityService : AccessibilityService() {
         while (target != null && !target.isClickable) target = target.parent
         if (target?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true) return true
 
-        val rect = Rect()
-        node.getBoundsInScreen(rect)
-        return !rect.isEmpty && clickAtCoordinates(rect.centerX().toFloat(), rect.centerY().toFloat())
+        node.getBoundsInScreen(tempRect)
+        return !tempRect.isEmpty && clickAtCoordinates(
+            tempRect.centerX().toFloat(),
+            tempRect.centerY().toFloat()
+        )
     }
 
+    /**
+     * OPT-NEW: CLICK_DURATION_MS = 50ms statt 100ms — halbierte Klick-Latenz.
+     */
     fun clickAtCoordinates(x: Float, y: Float): Boolean {
         val path = Path().apply { moveTo(x, y) }
         return dispatchGesture(
             GestureDescription.Builder()
-                .addStroke(GestureDescription.StrokeDescription(path, 0, 100))
+                .addStroke(GestureDescription.StrokeDescription(path, 0, CLICK_DURATION_MS))
                 .build(), null, null
         )
     }
@@ -372,7 +408,14 @@ class AgentAccessibilityService : AccessibilityService() {
         return false
     }
 
-    fun swipe(startX: Float, startY: Float, endX: Float, endY: Float, durationMs: Long = 300): Boolean {
+    /**
+     * OPT-NEW: durationMs-Default 300ms → 200ms für flüssigere Swipes.
+     */
+    fun swipe(
+        startX: Float, startY: Float,
+        endX: Float,   endY: Float,
+        durationMs: Long = 200L           // OPT: war 300
+    ): Boolean {
         val path = Path().apply { moveTo(startX, startY); lineTo(endX, endY) }
         return dispatchGesture(
             GestureDescription.Builder()
@@ -381,19 +424,23 @@ class AgentAccessibilityService : AccessibilityService() {
         )
     }
 
+    /**
+     * OPT-NEW: LONG_PRESS_DURATION_MS = 600ms statt 1000ms —
+     * systemweit reicht 500ms; 600ms gibt 20% Puffer ohne unnötige Verzögerung.
+     */
     fun longPressAt(x: Float, y: Float): Boolean {
         val path = Path().apply { moveTo(x, y) }
         return dispatchGesture(
             GestureDescription.Builder()
-                .addStroke(GestureDescription.StrokeDescription(path, 0, 1000))
+                .addStroke(GestureDescription.StrokeDescription(path, 0, LONG_PRESS_DURATION_MS))
                 .build(), null, null
         )
     }
 
-    fun pressBack()          = performGlobalAction(GLOBAL_ACTION_BACK)
-    fun pressHome()          = performGlobalAction(GLOBAL_ACTION_HOME)
-    fun openRecents()        = performGlobalAction(GLOBAL_ACTION_RECENTS)
-    fun openNotifications()  = performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
+    fun pressBack()         = performGlobalAction(GLOBAL_ACTION_BACK)
+    fun pressHome()         = performGlobalAction(GLOBAL_ACTION_HOME)
+    fun openRecents()       = performGlobalAction(GLOBAL_ACTION_RECENTS)
+    fun openNotifications() = performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
 
     fun getCurrentPackage(): String? {
         val wins = windows ?: return null
@@ -412,12 +459,14 @@ class AgentAccessibilityService : AccessibilityService() {
     // ─── Private helpers ──────────────────────────────────────────────────
 
     /**
-     * OPT-4: Bug-Fix — die ursprüngliche Version hatte `if (hint.isNullOrEmpty()) return node`
-     * als toten Code (hint war an diesem Punkt garantiert nicht null).
-     * Jetzt: hint==null → ersten editierbaren zurückgeben; hint gesetzt → Hint-Match prüfen,
-     * ohne Match weitersuchen in Kindern.
+     * OPT-4: Bug-Fix aus Original beibehalten.
+     * OPT-NEW: MAX_DEPTH-Pruning via depth-Parameter.
      */
-    private fun findEditableNode(node: AccessibilityNodeInfo, hint: String?): AccessibilityNodeInfo? {
+    private fun findEditableNode(
+        node: AccessibilityNodeInfo,
+        hint: String?,
+        depth: Int = 0
+    ): AccessibilityNodeInfo? {
         if (node.isEditable) {
             if (hint.isNullOrEmpty()) return node
             val text     = node.text?.toString() ?: ""
@@ -425,44 +474,52 @@ class AgentAccessibilityService : AccessibilityService() {
             val hintText = node.hintText?.toString() ?: ""
             if (text.contains(hint, true) || desc.contains(hint, true) || hintText.contains(hint, true))
                 return node
-            // Kein Hint-Match → weiter in Kindern suchen (korrekt, kein früher Return)
         }
+        if (depth >= MAX_DEPTH) return null   // OPT-NEW
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
-            val found = findEditableNode(child, hint)
+            val found = findEditableNode(child, hint, depth + 1)
             if (found != null) return found
             child.recycle()
         }
         return null
     }
 
-    private fun findScrollableNode(node: AccessibilityNodeInfo, targetText: String?): AccessibilityNodeInfo? {
+    private fun findScrollableNode(
+        node: AccessibilityNodeInfo,
+        targetText: String?,
+        depth: Int = 0
+    ): AccessibilityNodeInfo? {
         if (node.isScrollable) {
             if (targetText == null) return node
             val text = node.text?.toString() ?: ""
             val desc = node.contentDescription?.toString() ?: ""
             if (text.contains(targetText, true) || desc.contains(targetText, true)) return node
         }
+        if (depth >= MAX_DEPTH) return null   // OPT-NEW
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
-            val found = findScrollableNode(child, targetText)
+            val found = findScrollableNode(child, targetText, depth + 1)
             if (found != null) return found
             child.recycle()
         }
         return null
     }
 
-    private fun findKeyboardActionNode(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+    private fun findKeyboardActionNode(
+        node: AccessibilityNodeInfo,
+        depth: Int = 0
+    ): AccessibilityNodeInfo? {
         val label = (node.text?.toString().orEmpty().ifEmpty {
             node.contentDescription?.toString().orEmpty()
         }).trim().lowercase()
-        val actionLabels = setOf("search", "enter", "go", "done", "send", "next")
-        if (node.isClickable && (label in actionLabels || label.endsWith(" search"))) {
+        if (node.isClickable && (label in ACTION_LABELS || label.endsWith(" search"))) {
             return AccessibilityNodeInfo.obtain(node)
         }
+        if (depth >= MAX_DEPTH) return null   // OPT-NEW
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
-            val found = findKeyboardActionNode(child)
+            val found = findKeyboardActionNode(child, depth + 1)
             child.recycle()
             if (found != null) return found
         }
